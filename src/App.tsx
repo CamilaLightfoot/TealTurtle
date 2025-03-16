@@ -1,10 +1,16 @@
-import React from "react";
-import PoseDetection from "./components/PoseDetection";
+import React, { useRef } from "react";
+import HandposeDemo from "./components/PoseDetection";
 
-const App: React.FC = () => {
-  return (
-      <PoseDetection />
-  );
+interface AppProps {}
+
+const App: React.FC<AppProps> = () => {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  const handleHandGrab = () => {
+    console.log("Grab event triggered!");
+  };
+
+  return <HandposeDemo onHandGrab={handleHandGrab} containerRef={containerRef} />;
 };
 
 export default App;

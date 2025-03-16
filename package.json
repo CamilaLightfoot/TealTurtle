@@ -14,12 +14,15 @@
     "@tensorflow/tfjs": "^3.21.0",
     "@tensorflow/tfjs-backend-webgl": "^3.21.0",
     "cors": "^2.8.5",
+    "ml5": "^1.0.1",
     "node-fetch": "^3.3.2",
+    "p5": "^1.11.3",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.21.0",
+    "@types/p5": "^1.7.6",
     "@types/react": "^19.0.10",
     "@types/react-dom": "^19.0.4",
     "@vitejs/plugin-react": "^4.3.4",

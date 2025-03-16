@@ -1,253 +1,205 @@
-import React, { useRef, useEffect, useState } from "react";
-import * as tf from "@tensorflow/tfjs";
-import "@tensorflow/tfjs-backend-webgl"; // Ensure WebGL is loaded
-import * as posenet from "@tensorflow-models/posenet";
+import React, { useState, useRef, useEffect } from "react";
+import ml5 from "ml5";
+import p5 from "p5";
 
 import { useOpenAI } from "./hooks/useOpenAI";
 import { useSpeechSynthesis } from "./hooks/useSpeechSynthesis";
 
-
-// TypeScript interface for PoseNet keypoints
+// Define the structure of a keypoint
 interface Keypoint {
-  part: string;
-  position: { x: number; y: number };
-  score: number;
+  x: number;
+  y: number;
+  name: string;
 }
 
-interface Pose {
+// Define the structure of hand tracking results
+interface HandDetectionResult {
   keypoints: Keypoint[];
 }
 
-// Load and initialize PoseNet.
-const loadPoseNet = async (): Promise<posenet.PoseNet | null> => {
-  try {
-    // Check if WebGL is available; if not, fallback to CPU.
-    const isWebGLAvailable = tf.ENV.get("WEBGL_RENDER_FLOAT32_CAPABLE");
-    console.log("WebGL Supported:", isWebGLAvailable);
+interface HandDetectionProps {
+  onHandGrab?: (results: HandDetectionResult[]) => void;
+  containerRef: React.RefObject<HTMLDivElement | null>;
+}
 
-    if (isWebGLAvailable) {
-      await tf.setBackend("webgl"); // Use WebGL if available
-    } else {
-      console.warn("WebGL is not supported, switching to CPU backend.");
-      await tf.setBackend("cpu"); // Fallback to CPU
-    }
-    await tf.ready(); // Wait until TensorFlow is fully initialized
-
-    console.log("TensorFlow.js backend:", tf.getBackend());
-
-    const net = await posenet.load({
-      architecture: "ResNet50", // More accurate model
-      outputStride: 32,
-      inputResolution: { width: 640, height: 480 },
-      quantBytes: 2,
-    });
-
-    console.log("PoseNet Loaded");
-    return net;
-  } catch (error) {
-    console.error("Error loading PoseNet:", error);
-    return null;
+declare global {
+  interface Window {
+    fingerTips: Keypoint[];
+    knuckles: Keypoint[];
   }
-};
+}
 
-const PoseDetection: React.FC = () => {
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+window.fingerTips = [];
+window.knuckles = [];
+
+const HandDetection: React.FC<HandDetectionProps> = ({ onHandGrab, containerRef }) => {
+  const [fistClosed, setFistClosed] = useState(false);
+  const sketchRef = useRef<p5 | null>(null);
   const [aiResponse, setAiResponse] = useState<string>("");
   const [isAiResponding, setIsAiResponding] = useState(false); // Prevent multiple API calls.
-
+  
   const { fetchAIResponse, isLoading, error } = useOpenAI();
   const { speakText } = useSpeechSynthesis();
 
   useEffect(() => {
+    let handPose: any;
+    let video: p5.Element;
+    let hands: HandDetectionResult[] = [];
+    let recognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 
-    const setupCamera = async (): Promise<void> => {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-    
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-    
-        // Ensure video metadata is loaded before processing frames.
-        await new Promise<void>((resolve) => {
-          videoRef.current!.onloadedmetadata = () => {
-            console.log("Video Loaded:", videoRef.current!.videoWidth, "x", videoRef.current!.videoHeight);
-            resolve();
-          };
-        });
-    
-        console.log("Camera is ready:", videoRef.current.videoWidth, "x", videoRef.current.videoHeight);
-      }
-    };
-
-    async function detectPose(net: posenet.PoseNet): Promise<void> {
-      if (!videoRef.current || videoRef.current.videoWidth === 0 || videoRef.current.videoHeight === 0 || !canvasRef.current) {
-        console.warn("Skipping pose detection: Video is not ready");
+    const startSpeechRecognition = () => {
+      const SpeechRecognition =
+        (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+  
+      if (!SpeechRecognition) {
+        console.error("❌ Speech recognition is not supported in this browser.");
         return;
       }
-
-      // Prevent detection while AI is speaking.
-      if (isAiResponding) return;
-
-      // Set lock to prevent multiple API calls.
-      setIsAiResponding(true);
-
-      const inputTensor = tf.browser.fromPixels(videoRef.current);
-      const pose = await net.estimateSinglePose(inputTensor, {
-        flipHorizontal: false,
-      });
-      inputTensor.dispose(); // Need to dispose the tensor to free up memory.
-
-      //console.log("Pose Data:", pose.keypoints.map(kp => `${kp.part}: (${kp.position.x}, ${kp.position.y})`));
-      // !!!!!!!!!!!!!!!!!!! START Troubleshoot Keypoint Detection Section !!!!!!!!!!!!!!!!!!!!!!!
-      const ctx = canvasRef.current.getContext("2d");
-      if (!ctx) return;
-      ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
-      ctx.fillStyle = "red";
-
-      pose.keypoints.forEach((kp) => {
-        if (kp.score > 0.3) {
-          ctx.beginPath();
-          ctx.arc(kp.position.x, kp.position.y, 5, 0, 2 * Math.PI);
-          ctx.fill();
+  
+      recognition = new SpeechRecognition();
+      recognition.lang = navigator.language || "en-US";
+      recognition.continuous = true; // ✅ Keep listening continuously
+      recognition.interimResults = false;
+  
+      let lastAiResponse = ""; // Prevent AI loops
+  
+      recognition.onresult = async (event: any) => {
+        if (isAiResponding) return; // Prevent capturing AI's own speech
+  
+        setIsAiResponding(true);
+  
+        const spokenText = event.results[event.results.length - 1][0].transcript.trim();
+        console.log("🎙️ User Said:", spokenText);
+  
+        // Detect language from spoken text
+        const detectedLanguage = await detectLanguage(spokenText);
+        console.log(`🌍 Detected Language: ${detectedLanguage}`);
+  
+        if (spokenText.toLowerCase() === lastAiResponse.toLowerCase()) {
+          console.warn("⚠️ Ignoring AI's own response to prevent looping.");
+          return;
         }
+  
+        handleDetectedSpeech(spokenText, detectedLanguage);
+      };
+  
+      recognition.onerror = (error: any) => {
+        console.error("⚠️ Speech Recognition Error:", error);
+        setTimeout(() => {
+          console.log("🔄 Restarting speech recognition after error...");
+          recognition?.start();
+        }, 2000);
+      };
+  
+      // 🚀 Automatically pause during AI speech
+      window.speechSynthesis.addEventListener("start", () => {
+        console.log("🛑 Stopping speech recognition while AI is speaking...");
+        recognition?.abort();
       });
-
-      if (!pose || pose.keypoints.every((kp) => kp.score < 0.3)) {
-        console.warn("No clear pose detected.");
-        return;
-      }
-      // !!!!!!!!!!!!!!!!!!! END Troubleshoot Keypoint Detection Section !!!!!!!!!!!!!!!!!!!!!!!
-
-      // Detect specific gestures.
-      let userInput = "";
-      if (isHandRaised(pose)) {
-        console.log("The child raised their hand. How should I respond?");
-        userInput = "The child raised their hand. How should I respond?";
-      } else if (isHeadTilted(pose)) {
-        console.log("The child tilted their head. Do they feel dizzy?");
-        userInput = "The child tilted their head. Do they feel dizzy?";
-      }
-      else {
-        requestAnimationFrame(() => detectPose(net));
-      }
-      
-      // If an API call is already running, do not proceed.
-      if (!userInput || isAiResponding) return;
-
-      // If a gesture is detected, call AI for response.
-      try {
-        const aiText = await fetchAIResponse(userInput);
-        setAiResponse(aiText);
-        
-        // Wait for AI speech to finish before detecting again.
-        await speakText(aiText);
-        
-      } catch (error) {
-        console.error("Error in AI response:", error);
-      }
-
-      requestAnimationFrame(() => detectPose(net));
-    }
-
-    async function runPoseDetection(): Promise<void> {
-      await setupCamera();
-      const net = await loadPoseNet(); // `net` might be null if loading fails
-      
-      // Stop execution if PoseNet didn't load.
-      if (!net) {
-        console.error("PoseNet failed to load.");
-        return; 
-      }
-    
-      detectPose(net);
-    }
-
-    runPoseDetection();
-    listenForSpeech();
-  }, []);
-
-  // Helper function: Detect if hand is raised
-  function isHandRaised(pose: posenet.Pose): boolean {
-    const leftWrist = pose.keypoints.find((kp) => kp.part === "leftWrist");
-    const rightWrist = pose.keypoints.find((kp) => kp.part === "rightWrist");
-    const nose = pose.keypoints.find((kp) => kp.part === "nose");
   
-    //console.log("Left Wrist:", leftWrist);
-    //console.log("Right Wrist:", rightWrist);
-    //console.log("Nose:", nose);
+      // ✅ Restart speech recognition after AI finishes speaking
+      window.speechSynthesis.addEventListener("end", () => {
+        console.log("✅ AI speech finished. Resuming speech recognition...");
+        setTimeout(() => {
+          recognition?.start();
+        }, 4000); // ✅ 4-second delay to avoid AI loops
+      });
   
-    if (!leftWrist || !rightWrist || !nose) return false;
-  
-    return leftWrist.position.y < nose.position.y || rightWrist.position.y < nose.position.y;
-  }
-
-  // Helper function: Detect if head is tilted
-  function isHeadTilted(pose: posenet.Pose): boolean {
-    const leftEar = pose.keypoints.find((kp) => kp.part === "leftEar");
-    const rightEar = pose.keypoints.find((kp) => kp.part === "rightEar");
-  
-    //console.log("Left Ear:", leftEar);
-    //console.log("Right Ear:", rightEar);
-  
-    if (!leftEar || !rightEar) return false;
-  
-    return Math.abs(leftEar.position.y - rightEar.position.y) > 20;
-  }
-
-  const listenForSpeech = (): void => {
-    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-  
-    if (!SpeechRecognition) {
-      console.error("Speech recognition not supported in this browser.");
-      return;
-    }
-  
-    const recognition = new SpeechRecognition();
-    recognition.lang = navigator.language || "en-US"; // Auto-detect language
-    recognition.continuous = true; // Keep listening continuously
-    recognition.interimResults = false; // Get only the final recognized speech
-  
-    let lastAiResponse = ""; // Trying to avoid loops.
-
-    recognition.onresult = async (event: any) => {
-      if (isAiResponding) return; // Prevent capturing AI's own speech
-  
-      setIsAiResponding(true);
-
-      const spokenText = event.results[event.results.length - 1][0].transcript.trim();
-      console.log("User Said:", spokenText);
-  
-      // Detect language from spoken text
-      const detectedLanguage = await detectLanguage(spokenText);
-      console.log(`Detected Language: ${detectedLanguage}`);
-
-      if (spokenText.toLowerCase() === lastAiResponse.toLowerCase()) {
-        console.warn("Ignoring AI's own response to prevent looping.");
-        return;
-      }
-  
-      handleDetectedSpeech(spokenText, detectedLanguage);
-    };
-  
-    recognition.onerror = (error: any) => {
-      console.error("Speech Recognition Error:", error);
+      recognition.start();
     };
 
-    window.speechSynthesis.addEventListener("start", () => {
-      console.log("🛑 Stopping speech recognition while AI is speaking...");
-      recognition.abort(); // ✅ Immediate stop
-    });
-  
-    // ✅ Restart recognition with a **longer delay** to prevent picking up AI's speech
-    window.speechSynthesis.addEventListener("end", () => {
-      console.log("✅ AI speech finished. Resuming speech recognition...");
-      setTimeout(() => {
-        recognition.start();
-      }, 4000); // ✅ Wait 4 seconds before restarting
-    });
+    const sketch = (p: p5) => {
+      p.setup = () => {
+        p.createCanvas(640, 480);
+        video = p.createCapture(p.VIDEO);
+        video.size(640, 480);
+        video.hide(); // Hide the default video element
 
-    recognition.start();
-  };
+        // Initialize the handPose model
+        handPose = ml5.handPose(video.elt, () => {
+          console.log("✅ HandPose Model Loaded");
+        });
+
+        // Start detecting hands
+        handPose.detectStart(video.elt, gotHands);
+      };
+
+      // Check if the hand forms a closed fist
+      function isFistClosed(hand: HandDetectionResult) {
+        try {
+          window.fingerTips = hand.keypoints.filter((point) => point.name.includes("tip"));
+          window.knuckles = hand.keypoints.filter((point) => point.name.includes("mcp"));
+        } catch (error) {
+          return { result: false, points: null };
+        }
+
+        if (window.fingerTips.length === 5 && window.knuckles.length === 5) {
+          let avgFingerTipsY =
+            window.fingerTips.reduce((sum, tip) => sum + tip.y, 0) / window.fingerTips.length;
+          let avgKnucklesY =
+            window.knuckles.reduce((sum, knuckle) => sum + knuckle.y, 0) / window.knuckles.length;
+
+          //console.log(avgFingerTipsY);
+          //console.log(avgKnucklesY);
+
+          if (avgFingerTipsY > avgKnucklesY) {
+            let centerX =
+              window.fingerTips.reduce((sum, tip) => sum + tip.x, 0) / window.fingerTips.length;
+            let centerY = avgFingerTipsY;
+            return { result: true, points: { x: centerX, y: centerY } };
+          }
+        }
+
+        return { result: false, points: null };
+      }
+
+      // Callback for when handPose outputs data
+      function gotHands(results: HandDetectionResult[]) {
+        hands = results;
+        let fistStatus = false;
+        if (results.length > 0) {
+          fistStatus = isFistClosed(results[0]).result;
+        }
+
+        // Update the state to trigger UI changes
+        setFistClosed(fistStatus);
+
+        // Call the callback if a fist is detected
+        if (fistStatus && onHandGrab) {
+          onHandGrab(results);
+        }
+      }
+
+      p.draw = () => {
+        // Draw the webcam video onto the canvas
+        p.image(video, 0, 0, p.width, p.height);
+
+        // Draw all the tracked hand keypoints
+        hands.forEach((hand) => {
+          hand.keypoints.forEach((keypoint) => {
+            p.fill(0, 255, 0);
+            p.noStroke();
+            p.circle(keypoint.x, keypoint.y, 10);
+          });
+        });
+      };
+    };
+
+    // Instantiate the p5 sketch within the provided containerRef
+    if (containerRef.current) {
+      sketchRef.current = new p5(sketch, containerRef.current);
+    }
+
+    startSpeechRecognition();
+
+    // Cleanup on unmount: remove the p5 sketch and speech recognition.
+    return () => {
+      if (sketchRef.current) {
+        sketchRef.current.remove();
+      }
+      recognition?.stop();
+    };
+  }, [containerRef, onHandGrab]);
   
   async function handleDetectedSpeech(spokenText: string, language: string) {
   
@@ -284,51 +236,41 @@ const PoseDetection: React.FC = () => {
     const data = await response.json();
     return data.choices[0]?.message?.content.trim() || "en"; // Default to English if detection fails
   };
-  
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100vh" }}>
-      {/* Video & Canvas Wrapper */}
-      <div style={{ position: "relative", width: "640px", height: "480px", display: "flex", justifyContent: "center", alignItems: "center" }}>
-        {/* Camera Feed (Lowest Layer) */}
-        <video
-          ref={videoRef}
-          autoPlay
-          playsInline
-          style={{
-            position: "absolute",
-            top: 0,
-            left: 0,
-            width: "100%",
-            height: "100%",
-            zIndex: 1, // ✅ Lowest layer
-          }}
-        />
-  
-        {/* Pose Detection Canvas (Above Video) */}
-        <canvas
-          ref={canvasRef}
-          width="640"
-          height="480"
-          style={{
-            position: "absolute",
-            top: 0,
-            left: 0,
-            width: "100%",
-            height: "100%",
-            zIndex: 2, // ✅ Above video but below text
-            pointerEvents: "none", // Prevents interference with mouse clicks
-          }}
-        />
-      </div>
-  
-      {/* Centered UI Elements Below Video */}
-      <div style={{ textAlign: "center", marginTop: "20px" }}>
-        <h2>Interactive AI for Kids</h2>
-        <h3>AI Response: {aiResponse}</h3>
-      </div>
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        justifyContent: "center",
+        alignItems: "center",
+        height: "100vh", // Full viewport height
+        width: "100vw", // Full viewport width
+        textAlign: "center",
+        overflow: "hidden",
+        position: "relative",
+      }}
+    >
+      <h1>Interactive AI for Kids and Hand Grab Demo</h1>
+      <h3>AI Response: {aiResponse}</h3>
+      
+      {/* Centered container for p5.js canvas */}
+      <div
+        ref={containerRef}
+        style={{
+          display: "flex",
+          justifyContent: "center",
+          alignItems: "center",
+          height: "500px", // Matches canvas size
+          width: "640px",  // Matches canvas width
+          position: "relative",
+          backgroundColor: "black", // Just for debugging visibility
+        }}
+      />
+      
+      {fistClosed && <h3>Fist grabbed!</h3>}
     </div>
   );  
 };
 
-export default PoseDetection;
+export default HandDetection;
